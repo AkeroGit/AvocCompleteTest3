@@ -1,0 +1,107 @@
+import logging
+import os
+import sys
+
+import faiss
+import torch
+
+from voiceconversion.common.deviceManager.DeviceManager import DeviceManager
+from voiceconversion.data.imported_model_info import RVCImportedModelInfo
+from voiceconversion.embedder.EmbedderManager import EmbedderManager
+from voiceconversion.pitch_extractor.PitchExtractorManager import PitchExtractorManager
+from voiceconversion.RVC.inferencer.InferencerManager import InferencerManager
+from voiceconversion.RVC.pipeline.Pipeline import Pipeline
+
+logger = logging.getLogger(__name__)
+
+
+def createPipeline(
+    importedModelInfo: RVCImportedModelInfo,
+    f0Detector: str,
+    force_reload: bool,
+    pretrain_dir: str,
+):
+    # Inferencer 生成
+    if importedModelInfo.isONNX:
+        modelPath = os.path.join(
+            importedModelInfo.storageDir,
+            os.path.basename(importedModelInfo.modelFileOnnx),
+        )
+        inferencer = InferencerManager.getInferencer(
+            importedModelInfo.modelTypeOnnx, modelPath
+        )
+    else:
+        modelPath = os.path.join(
+            importedModelInfo.storageDir, os.path.basename(importedModelInfo.modelFile)
+        )
+        inferencer = InferencerManager.getInferencer(
+            importedModelInfo.modelType, modelPath
+        )
+
+    # Embedder 生成
+    embedder = EmbedderManager.get_embedder(
+        pretrain_dir, importedModelInfo.embedder, force_reload
+    )
+
+    # pitchExtractor
+    pitchExtractor = PitchExtractorManager.getPitchExtractor(
+        f0Detector, force_reload, pretrain_dir
+    )
+
+    # index, feature
+    indexPath = os.path.join(
+        importedModelInfo.storageDir, os.path.basename(importedModelInfo.indexFile)
+    )
+    index, index_reconstruct = _loadIndex(indexPath)
+
+    pipeline = Pipeline(
+        embedder,
+        inferencer,
+        pitchExtractor,
+        index,
+        index_reconstruct,
+        importedModelInfo.f0,
+        importedModelInfo.samplingRate,
+        importedModelInfo.embChannels,
+    )
+
+    return pipeline
+
+
+def _loadIndex(indexPath: str) -> tuple[faiss.Index | None, torch.Tensor | None]:
+    dev = DeviceManager.get_instance().device
+    # Indexのロード
+    logger.info("Loading index...")
+    # ファイル指定があってもファイルがない場合はNone
+    if os.path.exists(indexPath) is not True or os.path.isfile(indexPath) is not True:
+        logger.warning("Index file not found. Index will not be used.")
+        return (None, None)
+
+    logger.info(f'Try loading "{indexPath}"...')
+    try:
+        index: faiss.IndexIVFFlat = faiss.read_index(indexPath)
+        if not index.is_trained:
+            logger.error(
+                "Invalid index. You MUST use added_xxxx.index, not trained_xxxx.index. Index will not be used."
+            )
+            return (None, None)
+        if index.ntotal == 0:
+            logger.error("Index is empty. Index will not be used.")
+            return (None, None)
+        # BUG: faiss-gpu does not support reconstruct on GPU indices
+        # https://github.com/facebookresearch/faiss/issues/2181
+        index_reconstruct = index.reconstruct_n(0, index.ntotal).to(dev)
+        if (
+            sys.platform == "linux"
+            and "+cu" in torch.__version__
+            and dev.type == "cuda"
+        ):
+            index: faiss.GpuIndexIVFFlat = faiss.index_cpu_to_gpus_list(
+                index, gpus=[dev.index]
+            )
+    except Exception as e:  # NOQA
+        logger.error("Load index failed. Index will not be used.")
+        logger.exception(e)
+        return (None, None)
+
+    return index, index_reconstruct

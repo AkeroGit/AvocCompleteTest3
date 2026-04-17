@@ -1,0 +1,263 @@
+"""
+VoiceChangerV2向け
+"""
+
+import logging
+import os
+
+import torch
+from torchaudio import transforms as tat
+
+from voiceconversion.common.deviceManager.DeviceManager import DeviceManager
+from voiceconversion.common.TorchUtils import circular_write
+from voiceconversion.embedder.EmbedderManager import EmbedderManager
+from voiceconversion.Exceptions import PipelineNotInitializedException
+from voiceconversion.pitch_extractor.PitchExtractorManager import PitchExtractorManager
+from voiceconversion.RVC.consts import HUBERT_SAMPLE_RATE, WINDOW_SIZE
+from voiceconversion.RVC.pipeline.Pipeline import Pipeline
+from voiceconversion.RVC.pipeline.PipelineGenerator import createPipeline
+from voiceconversion.utils.VoiceChangerModel import AudioInOutFloat, VoiceChangerModel
+from voiceconversion.voice_changer_settings import VoiceChangerSettings
+
+logger = logging.getLogger(__name__)
+
+
+class RVCr2(VoiceChangerModel):
+    def __init__(
+        self,
+        settings: VoiceChangerSettings,
+    ):
+        self.voiceChangerType = "RVC"
+
+        self.device = DeviceManager.get_instance().device
+        EmbedderManager.initialize()
+        self.settings = settings
+
+        self.pipeline: Pipeline | None = None
+
+        self.convert_buffer: torch.Tensor | None = None
+        self.pitch_buffer: torch.Tensor | None = None
+        self.pitchf_buffer: torch.Tensor | None = None
+        self.return_length = 0
+        self.skip_head = 0
+        self.silence_front = 0
+
+        self.resampler_in: tat.Resample | None = None
+        self.resampler_out: tat.Resample | None = None
+
+        self.input_sample_rate = self.settings.inputSampleRate
+        self.output_sample_rate = self.settings.outputSampleRate
+
+        # Convert dB to RMS
+        self.inputSensitivity = 10 ** (self.settings.silentThreshold / 20)
+
+        self.is_half = DeviceManager.get_instance().use_fp16()
+        self.dtype = torch.float16 if self.is_half else torch.float32
+
+    def initialize(self, force_reload: bool, pretrain_dir: str):
+        logger.info("Initializing...")
+
+        # pipelineの生成
+        try:
+            self.pipeline = createPipeline(
+                self.settings.rvcImportedModelInfo,
+                self.settings.f0Detector,
+                force_reload,
+                pretrain_dir,
+            )
+        except Exception as e:  # NOQA
+            logger.error("Failed to create pipeline.")
+            logger.exception(e)
+            return
+
+        # 処理は16Kで実施(Pitch, embed, (infer))
+        self.resampler_in = tat.Resample(
+            orig_freq=self.input_sample_rate,
+            new_freq=HUBERT_SAMPLE_RATE,
+            dtype=torch.float32,
+        ).to(self.device)
+
+        self.resampler_out = tat.Resample(
+            orig_freq=self.settings.rvcImportedModelInfo.samplingRate,
+            new_freq=self.output_sample_rate,
+            dtype=torch.float32,
+        ).to(self.device)
+
+        logger.info("Initialized.")
+
+    def change_pitch_extractor(self, pretrain_dir: str):
+        pitchExtractor = PitchExtractorManager.getPitchExtractor(
+            self.settings.f0Detector, self.settings.gpu, pretrain_dir
+        )
+        self.pipeline.setPitchExtractor(pitchExtractor)
+
+    def realloc(
+        self,
+        block_frame: int,
+        extra_frame: int,
+        crossfade_frame: int,
+        sola_search_frame: int,
+    ):
+        # Calculate frame sizes based on DEVICE sample rate (f.e., 48000Hz) and convert to 16000Hz
+        block_frame_16k = int(block_frame / self.input_sample_rate * HUBERT_SAMPLE_RATE)
+        crossfade_frame_16k = int(
+            crossfade_frame / self.input_sample_rate * HUBERT_SAMPLE_RATE
+        )
+        sola_search_frame_16k = int(
+            sola_search_frame / self.input_sample_rate * HUBERT_SAMPLE_RATE
+        )
+        extra_frame_16k = int(extra_frame / self.input_sample_rate * HUBERT_SAMPLE_RATE)
+
+        convert_size_16k = (
+            block_frame_16k
+            + sola_search_frame_16k
+            + extra_frame_16k
+            + crossfade_frame_16k
+        )
+        if (
+            modulo := convert_size_16k % WINDOW_SIZE
+        ) != 0:  # モデルの出力のホップサイズで切り捨てが発生するので補う。
+            convert_size_16k = convert_size_16k + (WINDOW_SIZE - modulo)
+        self.convert_feature_size_16k = convert_size_16k // WINDOW_SIZE
+
+        self.skip_head = extra_frame_16k // WINDOW_SIZE
+        self.return_length = self.convert_feature_size_16k - self.skip_head
+        self.silence_front = (
+            extra_frame_16k - (WINDOW_SIZE * 5) if self.settings.silenceFront else 0
+        )
+
+        # Audio buffer to measure volume between chunks
+        audio_buffer_size = block_frame_16k + crossfade_frame_16k
+        self.audio_buffer = torch.zeros(
+            audio_buffer_size, dtype=self.dtype, device=self.device
+        )
+
+        # Audio buffer for conversion without silence
+        self.convert_buffer = torch.zeros(
+            convert_size_16k, dtype=self.dtype, device=self.device
+        )
+        # Additional +1 is to compensate for pitch extraction algorithm
+        # that can output additional feature.
+        self.pitch_buffer = torch.zeros(
+            self.convert_feature_size_16k + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.pitchf_buffer = torch.zeros(
+            self.convert_feature_size_16k + 1,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        logger.info(f"Allocated audio buffer size: {audio_buffer_size}")
+        logger.info(f"Allocated convert buffer size: {convert_size_16k}")
+        logger.info(
+            f"Allocated pitchf buffer size: {self.convert_feature_size_16k + 1}"
+        )
+
+    def convert(self, audio_in: AudioInOutFloat, sample_rate: int) -> torch.Tensor:
+        if self.pipeline is None:
+            raise PipelineNotInitializedException()
+
+        # Input audio is always float32
+        audio_in_t = torch.as_tensor(audio_in, dtype=torch.float32, device=self.device)
+        if self.is_half:
+            audio_in_t = audio_in_t.half()
+
+        convert_feature_size_16k = audio_in_t.shape[0] // WINDOW_SIZE
+
+        audio_in_16k = tat.Resample(
+            orig_freq=sample_rate, new_freq=HUBERT_SAMPLE_RATE, dtype=self.dtype
+        ).to(self.device)(audio_in_t)
+
+        vol_t = torch.sqrt(torch.square(audio_in_16k).mean())
+
+        audio_model = self.pipeline.exec(
+            self.settings.dstId,
+            audio_in_16k,
+            None,
+            None,
+            self.settings.rvcImportedModelInfo.defaultTune,
+            self.settings.rvcImportedModelInfo.defaultFormantShift,
+            self.settings.rvcImportedModelInfo.defaultIndexRatio,
+            convert_feature_size_16k,
+            0,
+            self.settings.rvcImportedModelInfo.embOutputLayer,
+            self.settings.rvcImportedModelInfo.useFinalProj,
+            0,
+            convert_feature_size_16k,
+            self.settings.rvcImportedModelInfo.defaultProtect,
+        )
+
+        # TODO: Need to handle resampling for individual files
+        # FIXME: Why the heck does it require another sqrt to amplify the volume?
+        audio_out: torch.Tensor = self.resampler_out(audio_model * torch.sqrt(vol_t))
+
+        return audio_out
+
+    def inference(self, audio_in: AudioInOutFloat):
+        if self.pipeline is None:
+            raise PipelineNotInitializedException()
+
+        assert self.convert_buffer is not None
+        assert self.resampler_in is not None
+        assert self.resampler_out is not None
+
+        # Input audio is always float32
+        audio_in_t = torch.as_tensor(audio_in, dtype=torch.float32, device=self.device)
+        audio_in_16k = self.resampler_in(audio_in_t)
+        if self.is_half:
+            audio_in_16k = audio_in_16k.half()
+
+        circular_write(audio_in_16k, self.audio_buffer)
+
+        vol_t = torch.sqrt(torch.square(self.audio_buffer).mean())
+        vol = max(vol_t.item(), 0)
+
+        if vol < self.inputSensitivity:
+            # Busy wait to keep power manager happy and clocks stable. Running pipeline on-demand seems to lag when the delay between
+            # voice changer activation is too high.
+            # https://forums.developer.nvidia.com/t/why-kernel-calculate-speed-got-slower-after-waiting-for-a-while/221059/9
+            self.pipeline.exec(
+                self.settings.dstId,
+                self.convert_buffer,
+                self.pitch_buffer,
+                self.pitchf_buffer,
+                self.settings.rvcImportedModelInfo.defaultTune,
+                self.settings.rvcImportedModelInfo.defaultFormantShift,
+                self.settings.rvcImportedModelInfo.defaultIndexRatio,
+                self.convert_feature_size_16k,
+                self.silence_front,
+                self.settings.rvcImportedModelInfo.embOutputLayer,
+                self.settings.rvcImportedModelInfo.useFinalProj,
+                self.skip_head,
+                self.return_length,
+                self.settings.rvcImportedModelInfo.defaultProtect,
+            )
+            return None, vol
+
+        circular_write(audio_in_16k, self.convert_buffer)
+
+        audio_model = self.pipeline.exec(
+            self.settings.dstId,
+            self.convert_buffer,
+            self.pitch_buffer,
+            self.pitchf_buffer,
+            self.settings.rvcImportedModelInfo.defaultTune,
+            self.settings.rvcImportedModelInfo.defaultFormantShift,
+            self.settings.rvcImportedModelInfo.defaultIndexRatio,
+            self.convert_feature_size_16k,
+            self.silence_front,
+            self.settings.rvcImportedModelInfo.embOutputLayer,
+            self.settings.rvcImportedModelInfo.useFinalProj,
+            self.skip_head,
+            self.return_length,
+            self.settings.rvcImportedModelInfo.defaultProtect,
+        )
+
+        # FIXME: Why the heck does it require another sqrt to amplify the volume?
+        audio_out: torch.Tensor = self.resampler_out(audio_model * torch.sqrt(vol_t))
+
+        return audio_out, vol
+
+    def __del__(self):
+        del self.pipeline
