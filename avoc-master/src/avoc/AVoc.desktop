@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=AVoc
+Exec=bash -lc './bin/avoc'
+Icon=AVoc
+Type=Application
+Categories=AudioVideo;Audio;

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AVOC_HOME is the install root that contains bin/, .venv/, app/, and data/.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+AVOC_HOME="${AVOC_HOME:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+
+export AVOC_HOME
+export AVOC_DATA_DIR="${AVOC_DATA_DIR:-${AVOC_HOME}/data}"
+
+mkdir -p \
+  "${AVOC_DATA_DIR}" \
+  "${AVOC_DATA_DIR}/settings" \
+  "${AVOC_DATA_DIR}/cache" \
+  "${AVOC_DATA_DIR}/logs" \
+  "${AVOC_DATA_DIR}/models" \
+  "${AVOC_DATA_DIR}/pretrain" \
+  "${AVOC_DATA_DIR}/voice_cards"
+
+# Keep all runtime writes under <root>/data.
+export XDG_DATA_HOME="${AVOC_DATA_DIR}"
+export XDG_CONFIG_HOME="${AVOC_DATA_DIR}/settings"
+export XDG_CACHE_HOME="${AVOC_DATA_DIR}/cache"
+export XDG_STATE_HOME="${AVOC_DATA_DIR}/logs"
+export TORCH_HOME="${AVOC_DATA_DIR}/cache/torch"
+export HF_HOME="${AVOC_DATA_DIR}/cache/huggingface"
+
+if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+  # shellcheck disable=SC1091
+  source "${AVOC_HOME}/.venv/bin/activate"
+fi
+
+APP_DIR="${AVOC_HOME}/app"
+if [[ -f "${APP_DIR}/main.py" ]]; then
+  cd "${APP_DIR}"
+  exec python -m main "$@"
+fi
+
+# Dev fallback when sources are still at the repository root.
+cd "${AVOC_HOME}"
+exec python -m main "$@"
